@@ -1,0 +1,186 @@
+# ────────────────────────────────────────────────────────────────────────────
+# Release — 跨平台二进制构建 + GitHub Release
+#
+# 触发时机：推送 v* tag（例如 v0.1.0）
+#
+# 构建矩阵（5 个目标平台）：
+#   ┌────────────────────────────────┬──────────────────┬────────────┐
+#   │ Target                         │ Runner           │ 工具       │
+#   ├────────────────────────────────┼──────────────────┼────────────┤
+#   │ x86_64-unknown-linux-gnu       │ ubuntu-latest    │ cargo      │
+#   │ aarch64-unknown-linux-gnu      │ ubuntu-latest    │ cross      │
+#   │ x86_64-apple-darwin            │ macos-13         │ cargo      │
+#   │ aarch64-apple-darwin           │ macos-latest     │ cargo      │
+#   │ x86_64-pc-windows-msvc         │ windows-latest   │ cargo      │
+#   └────────────────────────────────┴──────────────────┴────────────┘
+#
+# 发布方式：gh release create（GitHub CLI，Actions runner 已内置）
+# ────────────────────────────────────────────────────────────────────────────
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write   # gh release create / upload 需要写权限
+
+env:
+  BINARY: mysql-proxy-rs
+
+jobs:
+  # ── 1. 先跑一遍集成测试，确保这个 tag 是干净的 ─────────────────────────────
+  integration-test:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Run integration tests
+        run: |
+          docker compose -f docker-compose.test.yml \
+            up --build --abort-on-container-exit \
+            --exit-code-from runner
+
+      - name: Show proxy logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.test.yml logs proxy
+
+      - name: Cleanup
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v --remove-orphans
+
+  # ── 2. 跨平台构建 ──────────────────────────────────────────────────────────
+  build:
+    name: Build · ${{ matrix.target }}
+    needs: integration-test
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: false
+            archive_ext: tar.gz
+
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: true        # cross 负责 QEMU 模拟
+            archive_ext: tar.gz
+
+          - target: x86_64-apple-darwin
+            os: macos-13           # Intel Mac runner
+            use_cross: false
+            archive_ext: tar.gz
+
+          - target: aarch64-apple-darwin
+            os: macos-latest       # Apple Silicon runner
+            use_cross: false
+            archive_ext: tar.gz
+
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            use_cross: false
+            archive_ext: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Rust 工具链（pin 到 stable，按需可改为具体版本）
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # 缓存编译产物，大幅加速后续构建
+      - name: Cache Cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ matrix.target }}-cargo-
+
+      # 仅在需要交叉编译的 Linux ARM64 job 里安装 cross
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --locked
+
+      # ── 编译 ──────────────────────────────────────────────────────────────
+      - name: Build (cargo)
+        if: "!matrix.use_cross"
+        run: cargo build --release --locked --bin ${{ env.BINARY }} --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --release --locked --bin ${{ env.BINARY }} --target ${{ matrix.target }}
+
+      # ── 打包 ──────────────────────────────────────────────────────────────
+      # 归档名：mysql-proxy-rs-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+      - name: Package (tar.gz — Unix)
+        if: matrix.archive_ext == 'tar.gz'
+        shell: bash
+        run: |
+          BINARY_PATH="target/${{ matrix.target }}/release/${{ env.BINARY }}"
+          ARCHIVE="${{ env.BINARY }}-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
+          tar -czf "$ARCHIVE" -C "$(dirname "$BINARY_PATH")" "$(basename "$BINARY_PATH")"
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Package (zip — Windows)
+        if: matrix.archive_ext == 'zip'
+        shell: pwsh
+        run: |
+          $binaryPath = "target\${{ matrix.target }}\release\${{ env.BINARY }}.exe"
+          $archive    = "${{ env.BINARY }}-${{ github.ref_name }}-${{ matrix.target }}.zip"
+          Compress-Archive -Path $binaryPath -DestinationPath $archive
+          "ARCHIVE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # 把打好的归档传给 release job
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY }}-${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+          retention-days: 1
+
+  # ── 3. 创建 GitHub Release 并上传所有归档 ─────────────────────────────────
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 下载所有平台的归档到 ./dist/
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: ${{ env.BINARY }}-*
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh dist/
+
+      # gh 已内置于 GitHub Actions runner，无需额外安装
+      - name: Create GitHub Release and upload binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.ref_name }}"
+
+          # 从最近的 commit message 生成 release notes（也可改为手写模板）
+          gh release create "$TAG" \
+            --title "Release $TAG" \
+            --generate-notes \
+            dist/*

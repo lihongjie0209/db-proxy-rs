@@ -1,0 +1,22 @@
+# Test runner image: Python + pymysql + mysqlslap (from default-mysql-client).
+FROM python:3.11-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends default-mysql-client \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir pymysql==1.1.2
+
+COPY tests/integration_test.py /tests/integration_test.py
+
+WORKDIR /tests
+
+ENTRYPOINT ["python", "/tests/integration_test.py"]
+
+# Default: connect to services named "proxy" and run without managing
+# Docker / cargo lifecycle (those are handled by Compose itself).
+CMD ["--no-docker", \
+     "--proxy-host", "proxy", \
+     "--proxy-port", "3307", \
+     "--password", "proxy_test_pw", \
+     "--database", "proxy_test"]

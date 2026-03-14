@@ -1,0 +1,66 @@
+# docker-compose.test.yml
+#
+# 完整的集成测试环境：MySQL → proxy → runner (Python + mysqlslap)
+#
+# 用法
+# ────
+#   docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
+#
+# 查看结果
+#   docker compose -f docker-compose.test.yml logs runner
+#
+# 清理
+#   docker compose -f docker-compose.test.yml down -v --rmi local
+
+services:
+
+  # ── MySQL 8.0 ───────────────────────────────────────────────────────────────
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: proxy_test_pw
+      MYSQL_DATABASE:      proxy_test
+    # mysql_native_password keeps pymysql / mysqlslap auth simple.
+    command: --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost",
+             "-uroot", "-pproxy_test_pw", "--silent"]
+      interval:     5s
+      timeout:      5s
+      retries:      15
+      start_period: 20s
+
+  # ── mysql-proxy-rs ──────────────────────────────────────────────────────────
+  proxy:
+    build:
+      context:    .
+      dockerfile: Dockerfile
+    environment:
+      PROXY_LISTEN:   0.0.0.0:3307
+      PROXY_UPSTREAM: mysql:3306
+      RUST_LOG:       info
+    ports:
+      - "3317:3307"           # expose to host for ad-hoc debugging
+    depends_on:
+      mysql:
+        condition: service_healthy
+    # Healthcheck: try a raw TCP handshake using bash's /dev/tcp.
+    # The proxy image is Debian slim, which ships bash.
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/3307' 2>/dev/null"]
+      interval:     3s
+      timeout:      3s
+      retries:      10
+      start_period: 5s
+
+  # ── Test runner ─────────────────────────────────────────────────────────────
+  runner:
+    build:
+      context:    .
+      dockerfile: tests/Dockerfile.test
+    depends_on:
+      proxy:
+        condition: service_healthy
+    environment:
+      # Disable ANSI colors in plain Docker logs (set to "" to re-enable).
+      NO_COLOR: "1"
