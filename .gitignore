@@ -1,1 +1,10 @@
 /target
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Proxy test log
+proxy-test.log
+
