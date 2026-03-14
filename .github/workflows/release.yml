@@ -75,12 +75,12 @@ jobs:
             archive_ext: tar.gz
 
           - target: x86_64-apple-darwin
-            os: macos-13           # Intel Mac runner
+            os: macos-latest       # Apple Silicon runner，交叉编译 Intel 目标
             use_cross: false
             archive_ext: tar.gz
 
           - target: aarch64-apple-darwin
-            os: macos-latest       # Apple Silicon runner
+            os: macos-latest       # Apple Silicon runner，原生编译
             use_cross: false
             archive_ext: tar.gz
 
