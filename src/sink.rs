@@ -1,12 +1,15 @@
 //! Built-in [`EventSink`] implementations.
 //!
-//! | Type              | Description                                   |
-//! |-------------------|-----------------------------------------------|
-//! | [`TracingConsumer`] | Emits structured `tracing` log records      |
-//! | [`JsonlConsumer`]   | Appends JSON Lines to a file with timestamp |
-//! | [`MultiSink`]       | Fans out one event to multiple sinks        |
+//! | Type                | Description                                        |
+//! |---------------------|----------------------------------------------------|
+//! | [`TracingConsumer`] | Emits structured `tracing` log records             |
+//! | [`JsonlConsumer`]   | Appends JSON Lines to a file with timestamp        |
+//! | [`RedisSink`]       | RPUSHes JSON lines to a Redis list                 |
+//! | [`KafkaSink`]       | Produces JSON records to a Kafka topic             |
+//! | [`MultiSink`]       | Fans out one event to multiple sinks               |
 
 use std::{
+    collections::BTreeMap,
     fs::{File, OpenOptions},
     io::{BufWriter, Write},
     path::Path,
@@ -14,9 +17,38 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde::Serialize;
+use tokio::sync::mpsc::UnboundedSender;
 
+use serde::Serialize;
 use crate::event::{ConnInfo, Event, EventSink};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared JSON helper
+
+/// Wire format: timestamp + flattened ConnInfo + flattened Event.
+#[derive(Serialize)]
+struct LogRecord<'a> {
+    ts_ms: u128,
+    #[serde(flatten)]
+    conn:  &'a ConnInfo,
+    #[serde(flatten)]
+    event: &'a Event,
+}
+
+fn ts_ms() -> u128 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()
+}
+
+fn to_json_line(conn: &ConnInfo, event: &Event) -> Option<String> {
+    let record = LogRecord { ts_ms: ts_ms(), conn, event };
+    match serde_json::to_string(&record) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to serialize event to JSON");
+            None
+        }
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TracingConsumer
@@ -128,33 +160,157 @@ impl JsonlConsumer {
     }
 }
 
-/// Wire format: timestamp + flattened ConnInfo + flattened Event.
-#[derive(Serialize)]
-struct LogRecord<'a> {
-    ts_ms: u128,
-    #[serde(flatten)]
-    conn:  &'a ConnInfo,
-    #[serde(flatten)]
-    event: &'a Event,
-}
-
 impl EventSink for JsonlConsumer {
     fn on_event(&self, conn: &ConnInfo, event: Event) {
-        let ts_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
+        if let Some(line) = to_json_line(conn, &event) {
+            if let Ok(mut w) = self.writer.lock() {
+                let _ = writeln!(w, "{line}");
+                let _ = w.flush();
+            }
+        }
+    }
+}
 
-        let record = LogRecord { ts_ms, conn, event: &event };
+// ─────────────────────────────────────────────────────────────────────────────
+// RedisSink
 
-        match serde_json::to_string(&record) {
-            Ok(line) => {
-                if let Ok(mut w) = self.writer.lock() {
-                    let _ = writeln!(w, "{line}");
-                    let _ = w.flush();
+/// Pushes one JSON line per event to a Redis list using `RPUSH`.
+///
+/// # CLI format
+/// ```text
+/// redis=127.0.0.1:6379
+/// redis=127.0.0.1:6379/my-list-key
+/// redis=:password@127.0.0.1:6379/my-list-key
+/// ```
+///
+/// The `addr` argument may be `[user:password@]host:port` — it is prefixed
+/// with `redis://` to form the full connection URL.
+///
+/// Events are serialised in the same [`LogRecord`] format as [`JsonlConsumer`].
+/// Network I/O happens on a background task; the proxy forwarding path is never
+/// blocked.
+pub struct RedisSink {
+    tx: UnboundedSender<String>,
+}
+
+impl RedisSink {
+    /// Connect to Redis and spawn a background publisher task.
+    ///
+    /// `addr` is `[user:password@]host:port`; `list_key` is the Redis list name.
+    pub async fn new(addr: &str, list_key: &str) -> anyhow::Result<Self> {
+        // Build a standard redis:// URL so the crate handles auth automatically.
+        let url = if addr.starts_with("redis://") || addr.starts_with("rediss://") {
+            addr.to_string()
+        } else {
+            format!("redis://{addr}")
+        };
+        let client = redis::Client::open(url.as_str())
+            .map_err(|e| anyhow::anyhow!("redis connect to {url}: {e}"))?;
+        let mut conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| anyhow::anyhow!("redis handshake {url}: {e}"))?;
+
+        let key = list_key.to_string();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        tokio::spawn(async move {
+            while let Some(line) = rx.recv().await {
+                if let Err(e) = redis::cmd("RPUSH")
+                    .arg(&key)
+                    .arg(&line)
+                    .query_async::<()>(&mut conn)
+                    .await
+                {
+                    tracing::warn!(error = %e, "redis RPUSH failed");
                 }
             }
-            Err(e) => tracing::warn!(error = %e, "failed to serialize event to JSON"),
+        });
+
+        Ok(Self { tx })
+    }
+}
+
+impl EventSink for RedisSink {
+    fn on_event(&self, conn: &ConnInfo, event: Event) {
+        if let Some(line) = to_json_line(conn, &event) {
+            let _ = self.tx.send(line);
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// KafkaSink
+
+/// Produces one JSON record per event to a Kafka topic (partition determined by
+/// `conn_id` key).
+///
+/// # CLI format
+/// ```text
+/// kafka=127.0.0.1:9092
+/// kafka=127.0.0.1:9092/my-topic
+/// ```
+///
+/// Each Kafka record uses `"{upstream}|{conn_id}|{proxy}"` as the **message
+/// key** (UTF-8 bytes).  Kafka's default murmur2 hash partitioner guarantees
+/// that all events sharing the same key are routed to the same partition,
+/// preserving per-connection ordering for consumers.  The key is also
+/// human-readable, making it easy to filter or trace events in Kafka tooling.
+///
+/// Uses [`rskafka`] (pure-Rust, no C dependency). Network I/O happens on a
+/// background task; the proxy forwarding path is never blocked.
+pub struct KafkaSink {
+    tx: UnboundedSender<(String, String)>,
+}
+
+impl KafkaSink {
+    /// Connect to Kafka and spawn a background producer task.
+    pub async fn new(broker: &str, topic: &str) -> anyhow::Result<Self> {
+        use rskafka::client::{
+            partition::{Compression, UnknownTopicHandling},
+            ClientBuilder,
+        };
+        use rskafka::record::Record;
+
+        let client = ClientBuilder::new(vec![broker.to_string()])
+            .build()
+            .await
+            .map_err(|e| anyhow::anyhow!("kafka connect to {broker}: {e}"))?;
+
+        let partition = client
+            .partition_client(topic, 0, UnknownTopicHandling::Retry)
+            .await
+            .map_err(|e| anyhow::anyhow!("kafka partition_client topic={topic}: {e}"))?;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+
+        tokio::spawn(async move {
+            while let Some((key, line)) = rx.recv().await {
+                let record = Record {
+                    key: Some(key.into_bytes()),
+                    value: Some(line.into_bytes()),
+                    headers: BTreeMap::new(),
+                    timestamp: chrono::Utc::now(),
+                };
+                if let Err(e) = partition
+                    .produce(vec![record], Compression::NoCompression)
+                    .await
+                {
+                    tracing::warn!(error = %e, "kafka produce failed");
+                }
+            }
+        });
+
+        Ok(Self { tx })
+    }
+}
+
+impl EventSink for KafkaSink {
+    fn on_event(&self, conn: &ConnInfo, event: Event) {
+        if let Some(line) = to_json_line(conn, &event) {
+            // key format: "{upstream}|{conn_id}|{proxy}"
+            let key = format!("{}|{}|{}", conn.upstream, conn.conn_id, conn.proxy);
+            let _ = self.tx.send((key, line));
         }
     }
 }
