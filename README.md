@@ -23,7 +23,7 @@ Client ──► db-proxy-rs :3307 / :5433 ──► MySQL :3306 / PostgreSQL :5
 - **透明转发**：字节流零修改，客户端无感知
 - **多协议解析**：
   - MySQL：握手、认证、`COM_QUERY`、`COM_STMT_PREPARE/EXECUTE`、`COM_INIT_DB`、`COM_QUIT`
-  - PostgreSQL：startup/auth、simple query、extended query（`Parse` / `Bind` / `Describe` / `Execute` / `Close` / `Sync`）
+  - PostgreSQL：startup/auth、simple query、extended query（`Parse` / `Bind` / `Describe` / `Execute` / `Close` / `Flush` / `Sync` / `Terminate`）
 - **预处理语句参数还原**：记录执行时的绑定参数值（MySQL `COM_STMT_EXECUTE` / PostgreSQL `Bind`）
 - **多输出后端**：结构化日志（控制台）和 JSON Lines 文件，可同时开启
 - **高性能**：分析器在独立 task 运行，崩溃或延迟不影响转发
@@ -125,6 +125,9 @@ INFO db_proxy_rs::sink: pg execute  client="127.0.0.1:54432" portal="" sql="INSE
 ```json
 {"ts_ms":1710000000000,"type":"query","client":"127.0.0.1:54321","sql":"SELECT 1"}
 {"ts_ms":1710000000012,"type":"query_ok","client":"127.0.0.1:54321","affected_rows":0,"last_insert_id":null,"warnings":0}
+{"ts_ms":1773817966247,"protocol":"postgres","type":"pg_startup","client":"127.0.0.1:65419","user":"postgres","database":"proxy_test","protocol_version":196608,"params":{"database":"proxy_test","user":"postgres"}}
+{"ts_ms":1773817966264,"protocol":"postgres","type":"pg_simple_query","client":"127.0.0.1:65419","user":"postgres","database":"proxy_test","sql":"SELECT 1"}
+{"ts_ms":1773817966266,"protocol":"postgres","type":"pg_command_complete","client":"127.0.0.1:65419","tag":"SELECT 1"}
 ```
 
 ---
@@ -165,6 +168,11 @@ PostgreSQL 测试覆盖：
 - 并发连接
 - 错误透传
 
+`tests/integration_test_pg.py` 默认会同时生成：
+
+- `proxy-test-pg.log`：结构化控制台日志
+- `proxy-test-pg.jsonl`：JSON Lines 输出，便于直接检查 PG 事件序列
+
 一键运行：
 
 ```bash
@@ -193,6 +201,12 @@ python tests/integration_test.py --mysql-port 3316 --proxy-port 3317
 
 # PostgreSQL
 python tests/integration_test_pg.py
+```
+
+当前 Windows 本地打包产物示例：
+
+```text
+dist\db-proxy-rs-v0.1.0-x86_64-pc-windows-msvc.zip
 ```
 
 ---
