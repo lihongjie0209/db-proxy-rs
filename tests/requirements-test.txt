@@ -1,2 +1,3 @@
 # mysql-proxy-rs 集成测试依赖
 pymysql>=1.1.0
+psycopg[binary]>=3.1

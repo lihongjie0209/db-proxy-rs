@@ -1,11 +1,12 @@
 [package]
-name = "mysql-proxy-rs"
+name = "db-proxy-rs"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 tokio              = { version = "1",   features = ["full"] }
 mysql_common       = "0.32"
+postgres-protocol  = "0.6"
 bytes              = "1"
 serde              = { version = "1",   features = ["derive"] }
 serde_json         = "1"
@@ -16,3 +17,4 @@ anyhow             = "1"
 redis              = { version = "0.27", features = ["tokio-comp"] }
 rskafka            = "0.5"
 chrono             = "0.4"
+fallible-iterator  = "0.2"

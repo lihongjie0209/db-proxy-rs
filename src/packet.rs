@@ -21,8 +21,7 @@ pub fn try_read_packet(buf: &mut BytesMut) -> Option<RawPacket> {
     if buf.len() < 4 {
         return None;
     }
-    let payload_len =
-        (buf[0] as usize) | ((buf[1] as usize) << 8) | ((buf[2] as usize) << 16);
+    let payload_len = (buf[0] as usize) | ((buf[1] as usize) << 8) | ((buf[2] as usize) << 16);
     if buf.len() < 4 + payload_len {
         return None;
     }

@@ -1,41 +1,48 @@
-//! mysql-proxy-rs — transparent MySQL proxy that logs SQL traffic.
+//! db-proxy-rs — transparent SQL proxy that logs wire-protocol traffic.
 //!
 //! # Usage
 //!
 //! ```text
-//! # Console only (default)
-//! mysql-proxy-rs
+//! # Console only (default, MySQL mode)
+//! db-proxy-rs
 //!
 //! # JSONL file
-//! mysql-proxy-rs --output jsonl=/tmp/queries.jsonl
+//! db-proxy-rs --output jsonl=/tmp/queries.jsonl
 //!
 //! # Redis list
-//! mysql-proxy-rs --output redis=127.0.0.1:6379
-//! mysql-proxy-rs --output redis=127.0.0.1:6379/my-list
+//! db-proxy-rs --output redis=127.0.0.1:6379
+//! db-proxy-rs --output redis=127.0.0.1:6379/my-list
 //!
 //! # Kafka topic
-//! mysql-proxy-rs --output kafka=127.0.0.1:9092/mysql-events
+//! db-proxy-rs --output kafka=127.0.0.1:9092/mysql-events
 //!
 //! # Multiple outputs
-//! mysql-proxy-rs --output console --output jsonl=/tmp/queries.jsonl
-//! mysql-proxy-rs --output redis=127.0.0.1:6379 --output kafka=127.0.0.1:9092
+//! db-proxy-rs --output console --output jsonl=/tmp/queries.jsonl
+//! db-proxy-rs --output redis=127.0.0.1:6379 --output kafka=127.0.0.1:9092
+//!
+//! # PostgreSQL mode
+//! db-proxy-rs --protocol postgres --listen 0.0.0.0:5433 --upstream 127.0.0.1:5432
 //! ```
 //!
 //! Set `RUST_LOG=debug` for verbose output (auth exchange, ping, etc.).
 
 mod analyzer;
 mod event;
+mod mysql_analyzer;
 mod packet;
+mod postgres_analyzer;
+mod protocol;
 mod proxy;
 mod sink;
 
 use std::{path::PathBuf, str::FromStr, sync::Arc};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::Parser;
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 use event::EventSink;
+use protocol::Protocol;
 use sink::{JsonlConsumer, KafkaSink, MultiSink, RedisSink, TracingConsumer};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -56,7 +63,7 @@ enum OutputSpec {
     Kafka { broker: String, topic: String },
 }
 
-const DEFAULT_REDIS_KEY:   &str = "mysql-proxy-events";
+const DEFAULT_REDIS_KEY: &str = "mysql-proxy-events";
 const DEFAULT_KAFKA_TOPIC: &str = "mysql-proxy-events";
 
 impl FromStr for OutputSpec {
@@ -91,7 +98,7 @@ fn split_addr_key(s: &str, default_name: &str) -> (String, String) {
     // Find the LAST '/' to avoid splitting IPv6 brackets or protocol slashes.
     match s.rfind('/') {
         Some(pos) => (s[..pos].to_string(), s[pos + 1..].to_string()),
-        None      => (s.to_string(), default_name.to_string()),
+        None => (s.to_string(), default_name.to_string()),
     }
 }
 
@@ -121,9 +128,9 @@ impl OutputSpec {
 
 #[derive(Parser)]
 #[command(
-    name    = "mysql-proxy-rs",
+    name = "db-proxy-rs",
     version,
-    about   = "Transparent MySQL proxy — tee(1) for MySQL traffic",
+    about = "Transparent SQL proxy — tee(1) for MySQL and PostgreSQL traffic",
     after_help = "\
 OUTPUT FORMATS
   console                   Structured log to stderr (respects RUST_LOG)
@@ -132,19 +139,24 @@ OUTPUT FORMATS
   kafka=<host:port>[/<topic>] Produce JSON to a Kafka topic (default: mysql-proxy-events)
 
 EXAMPLES
-  mysql-proxy-rs
-  mysql-proxy-rs --output jsonl=/var/log/mysql-proxy.jsonl
-  mysql-proxy-rs --output console --output jsonl=/tmp/queries.jsonl
-  mysql-proxy-rs --output redis=127.0.0.1:6379
-  mysql-proxy-rs --output redis=:mypassword@127.0.0.1:6379/my-list --output console
-  mysql-proxy-rs --output kafka=127.0.0.1:9092/mysql-events"
+  db-proxy-rs
+  db-proxy-rs --output jsonl=/var/log/mysql-proxy.jsonl
+  db-proxy-rs --output console --output jsonl=/tmp/queries.jsonl
+  db-proxy-rs --protocol postgres --listen 0.0.0.0:5433 --upstream 127.0.0.1:5432
+  db-proxy-rs --output redis=127.0.0.1:6379
+  db-proxy-rs --output redis=:mypassword@127.0.0.1:6379/my-list --output console
+  db-proxy-rs --output kafka=127.0.0.1:9092/mysql-events"
 )]
 struct Args {
+    /// Protocol spoken by the client and upstream server.
+    #[arg(long, value_enum, default_value_t = Protocol::Mysql, env = "PROXY_PROTOCOL")]
+    protocol: Protocol,
+
     /// Proxy listen address.
     #[arg(short, long, default_value = "0.0.0.0:3307", env = "PROXY_LISTEN")]
     listen: String,
 
-    /// Upstream MySQL server.
+    /// Upstream MySQL/PostgreSQL server.
     #[arg(short, long, default_value = "127.0.0.1:3306", env = "PROXY_UPSTREAM")]
     upstream: String,
 
@@ -189,7 +201,5 @@ async fn main() -> Result<()> {
         Arc::new(MultiSink::new(sinks))
     };
 
-    proxy::run(&args.listen, &args.upstream, sink).await
+    proxy::run(&args.listen, &args.upstream, args.protocol, sink).await
 }
-
-

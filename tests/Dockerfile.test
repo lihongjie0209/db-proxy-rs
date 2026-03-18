@@ -1,13 +1,16 @@
-# Test runner image: Python + pymysql + mysqlslap (from default-mysql-client).
+# Test runner image: Python + MySQL/PostgreSQL clients.
 FROM python:3.11-slim
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends default-mysql-client \
+ && apt-get install -y --no-install-recommends default-mysql-client postgresql-client \
  && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir pymysql==1.1.2
+COPY tests/requirements-test.txt /tmp/requirements-test.txt
+
+RUN pip install --no-cache-dir -r /tmp/requirements-test.txt
 
 COPY tests/integration_test.py /tests/integration_test.py
+COPY tests/integration_test_pg.py /tests/integration_test_pg.py
 
 WORKDIR /tests
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-mysql-proxy-rs 集成测试框架
+db-proxy-rs 集成测试框架
 =================================
 
 测试流程
@@ -98,7 +98,7 @@ DEFAULT_MYSQL_PORT    = 3316
 DEFAULT_PROXY_PORT    = 3317
 DEFAULT_PASSWORD      = "proxy_test_pw"
 DEFAULT_DATABASE      = "proxy_test"
-_CONTAINER_NAME       = "mysql-proxy-rs-integration"
+_CONTAINER_NAME       = "db-proxy-rs-integration"
 
 # ── 工具函数 ──────────────────────────────────────────────────────────────────
 
@@ -213,7 +213,7 @@ class DockerMySQL:
 
 class Proxy:
     """
-    编译并启动 mysql-proxy-rs 二进制文件。
+    编译并启动 db-proxy-rs 二进制文件。
 
     使用方式::
 
@@ -239,13 +239,13 @@ class Proxy:
     def start(self) -> "Proxy":
         if not self.no_build:
             _info("编译代理（cargo build）…")
-            _run(["cargo", "build", "--bin", "mysql-proxy-rs"])
+            _run(["cargo", "build", "--bin", "db-proxy-rs"])
             _ok("代理编译成功")
 
         binary = (
-            r"target\debug\mysql-proxy-rs.exe"
+            r"target\debug\db-proxy-rs.exe"
             if sys.platform == "win32"
-            else "target/debug/mysql-proxy-rs"
+            else "target/debug/db-proxy-rs"
         )
 
         _info(
@@ -638,7 +638,7 @@ def _check_prerequisites(no_build: bool, no_docker: bool) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="mysql-proxy-rs 集成测试框架",
+        description="db-proxy-rs 集成测试框架",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(

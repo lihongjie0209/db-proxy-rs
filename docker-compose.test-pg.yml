@@ -1,0 +1,61 @@
+# docker-compose.test-pg.yml
+#
+# PostgreSQL → proxy → runner 的完整集成测试环境
+
+services:
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: proxy_test_pw
+      POSTGRES_DB: proxy_test
+      POSTGRES_USER: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d proxy_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
+
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      PROXY_PROTOCOL: postgres
+      PROXY_LISTEN: 0.0.0.0:5433
+      PROXY_UPSTREAM: postgres:5432
+      RUST_LOG: info
+    ports:
+      - "55433:5433"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/5433' 2>/dev/null"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  runner:
+    build:
+      context: .
+      dockerfile: tests/Dockerfile.test
+    depends_on:
+      proxy:
+        condition: service_healthy
+    environment:
+      NO_COLOR: "1"
+    command:
+      - python
+      - /tests/integration_test_pg.py
+      - --no-docker
+      - --proxy-host
+      - proxy
+      - --proxy-port
+      - "5433"
+      - --password
+      - proxy_test_pw
+      - --database
+      - proxy_test

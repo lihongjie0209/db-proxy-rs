@@ -7,7 +7,11 @@
 //! Each call to [`EventSink::on_event`] also carries a [`ConnInfo`] that
 //! describes the connection context at the time the event was emitted.
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
+
+use crate::protocol::Protocol;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Connection metadata
@@ -23,11 +27,12 @@ use serde::Serialize;
 /// - `database` — current default database (updated on `USE` / `COM_INIT_DB`)
 #[derive(Debug, Clone, Serialize)]
 pub struct ConnInfo {
-    pub conn_id:  u64,
-    pub proxy:    String,
+    pub protocol: Protocol,
+    pub conn_id: u64,
+    pub proxy: String,
     pub upstream: String,
-    pub client:   String,
-    pub user:     String,
+    pub client: String,
+    pub user: String,
     pub database: Option<String>,
 }
 
@@ -43,13 +48,12 @@ pub struct ConnInfo {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
     // ── Handshake phase ──────────────────────────────────────────────────────
-
     /// Server sent its initial greeting packet.
     ServerHello {
         server_version: String,
         /// MySQL server-assigned connection id (not the proxy's `conn_id`).
-        mysql_conn_id:  u32,
-        auth_plugin:    String,
+        mysql_conn_id: u32,
+        auth_plugin: String,
     },
 
     /// Client sent its authentication response.
@@ -61,13 +65,9 @@ pub enum Event {
     Authenticated,
 
     /// Authentication failed.
-    AuthFailed {
-        code:    u16,
-        message: String,
-    },
+    AuthFailed { code: u16, message: String },
 
     // ── Command phase (client → server) ──────────────────────────────────────
-
     /// A plain-text SQL query (`COM_QUERY`).
     Query { sql: String },
 
@@ -78,11 +78,11 @@ pub enum Event {
     StmtPrepare {
         /// Statement id assigned by MySQL server — use this to correlate
         /// with `StmtExecute` events carrying the same `stmt_id`.
-        stmt_id:    u32,
+        stmt_id: u32,
         /// Number of `?` parameters in the prepared statement.
         num_params: u16,
         /// The original SQL template sent by the client.
-        sql:        String,
+        sql: String,
     },
 
     /// Execution of a previously prepared statement (`COM_STMT_EXECUTE`).
@@ -91,10 +91,10 @@ pub enum Event {
         stmt_id: u32,
         /// Original SQL template (e.g. `SELECT * FROM t WHERE id = ?`).
         /// Present when the matching `COM_STMT_PREPARE` was observed.
-        sql:     Option<String>,
+        sql: Option<String>,
         /// Decoded binary-protocol parameter values, in positional order.
         #[serde(serialize_with = "serialize_mysql_params")]
-        params:  Vec<mysql_common::value::Value>,
+        params: Vec<mysql_common::value::Value>,
     },
 
     /// `USE <database>` (`COM_INIT_DB`).
@@ -105,19 +105,109 @@ pub enum Event {
     Quit,
 
     // ── Command phase (server → client) ──────────────────────────────────────
-
     /// Server returned OK after a command.
     QueryOk {
-        affected_rows:  u64,
+        affected_rows: u64,
         last_insert_id: Option<u64>,
-        warnings:       u16,
+        warnings: u16,
     },
 
     /// Server returned an error in response to a command.
     QueryError {
-        code:      u16,
+        code: u16,
         sql_state: Option<String>,
-        message:   String,
+        message: String,
+    },
+
+    // ── PostgreSQL handshake / command phase ────────────────────────────────
+    /// Client sent a PostgreSQL startup message.
+    PgStartup {
+        protocol_version: i32,
+        params: BTreeMap<String, String>,
+    },
+
+    /// Client asked whether TLS can be negotiated.
+    PgSslRequest,
+
+    /// Client sent a cancel request on a dedicated connection.
+    PgCancelRequest { process_id: i32, secret_key: i32 },
+
+    /// Server requested an authentication method or step.
+    PgAuthRequest { method: String },
+
+    /// PostgreSQL authentication succeeded.
+    PgAuthenticated,
+
+    /// PostgreSQL authentication failed.
+    PgAuthFailed {
+        severity: Option<String>,
+        code: Option<String>,
+        message: String,
+    },
+
+    /// Simple query protocol (`Q`).
+    PgSimpleQuery { sql: String },
+
+    /// Extended query `Parse`.
+    PgParse {
+        statement: String,
+        sql: String,
+        param_types: Vec<u32>,
+    },
+
+    /// Extended query `Bind`.
+    PgBind {
+        portal: String,
+        statement: String,
+        param_formats: Vec<i16>,
+        params: Vec<Option<String>>,
+        result_formats: Vec<i16>,
+    },
+
+    /// Extended query `Describe`.
+    PgDescribe { target: String, name: String },
+
+    /// Extended query `Execute`.
+    PgExecute {
+        portal: String,
+        statement: Option<String>,
+        sql: Option<String>,
+        params: Vec<Option<String>>,
+        max_rows: i32,
+    },
+
+    /// Extended query `Close`.
+    PgClose { target: String, name: String },
+
+    /// Extended query `Flush`.
+    PgFlush,
+
+    /// Extended query `Sync`.
+    PgSync,
+
+    /// Client sent `Terminate`.
+    PgTerminate,
+
+    /// Server completed parsing a prepared statement.
+    PgParseComplete,
+
+    /// Server completed binding a portal.
+    PgBindComplete,
+
+    /// Server completed closing a statement / portal.
+    PgCloseComplete,
+
+    /// Server returned a command completion tag.
+    PgCommandComplete { tag: String },
+
+    /// Server returned `ReadyForQuery`.
+    PgReadyForQuery { status: String },
+
+    /// Server returned an error.
+    PgError {
+        severity: Option<String>,
+        code: Option<String>,
+        message: String,
     },
 }
 
@@ -134,7 +224,7 @@ pub enum Event {
 /// | Date / DateTime  | `"YYYY-MM-DDTHH:MM:SS.ffffff"` (ISO 8601)  |
 /// | Time             | `"[-]HHH:MM:SS.ffffff"`                     |
 fn serialize_mysql_params<S>(
-    params:     &[mysql_common::value::Value],
+    params: &[mysql_common::value::Value],
     serializer: S,
 ) -> Result<S::Ok, S::Error>
 where
@@ -147,11 +237,11 @@ where
     for v in params {
         match v {
             Value::NULL => seq.serialize_element(&Option::<()>::None)?,
-            Value::Int(i)    => seq.serialize_element(i)?,
-            Value::UInt(u)   => seq.serialize_element(u)?,
-            Value::Float(f)  => seq.serialize_element(f)?,
+            Value::Int(i) => seq.serialize_element(i)?,
+            Value::UInt(u) => seq.serialize_element(u)?,
+            Value::Float(f) => seq.serialize_element(f)?,
             Value::Double(d) => seq.serialize_element(d)?,
-            Value::Bytes(b)  => match std::str::from_utf8(b) {
+            Value::Bytes(b) => match std::str::from_utf8(b) {
                 Ok(s) => seq.serialize_element(s)?,
                 Err(_) => {
                     let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
@@ -189,5 +279,3 @@ where
 pub trait EventSink: Send + Sync + 'static {
     fn on_event(&self, conn: &ConnInfo, event: Event);
 }
-
-

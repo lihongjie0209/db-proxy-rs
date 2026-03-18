@@ -19,8 +19,8 @@ use std::{
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use serde::Serialize;
 use crate::event::{ConnInfo, Event, EventSink};
+use serde::Serialize;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared JSON helper
@@ -30,17 +30,24 @@ use crate::event::{ConnInfo, Event, EventSink};
 struct LogRecord<'a> {
     ts_ms: u128,
     #[serde(flatten)]
-    conn:  &'a ConnInfo,
+    conn: &'a ConnInfo,
     #[serde(flatten)]
     event: &'a Event,
 }
 
 fn ts_ms() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 fn to_json_line(conn: &ConnInfo, event: &Event) -> Option<String> {
-    let record = LogRecord { ts_ms: ts_ms(), conn, event };
+    let record = LogRecord {
+        ts_ms: ts_ms(),
+        conn,
+        event,
+    };
     match serde_json::to_string(&record) {
         Ok(s) => Some(s),
         Err(e) => {
@@ -62,75 +69,220 @@ pub struct TracingConsumer;
 
 impl EventSink for TracingConsumer {
     fn on_event(&self, conn: &ConnInfo, event: Event) {
-        let cid      = conn.conn_id;
-        let client   = &conn.client;
-        let user     = &conn.user;
+        let cid = conn.conn_id;
+        let client = &conn.client;
+        let user = &conn.user;
         let upstream = &conn.upstream;
-        let db       = conn.database.as_deref().unwrap_or("-");
+        let db = conn.database.as_deref().unwrap_or("-");
+        let protocol = conn.protocol.as_str();
 
         match event {
-            Event::ServerHello { server_version, mysql_conn_id, auth_plugin } => {
+            Event::ServerHello {
+                server_version,
+                mysql_conn_id,
+                auth_plugin,
+            } => {
                 tracing::info!(
-                    conn_id = cid, %client, %upstream,
+                    conn_id = cid, protocol, %client, %upstream,
                     server_version, mysql_conn_id, auth_plugin,
                     "server hello"
                 );
             }
             Event::ClientHandshake => {
                 tracing::info!(
-                    conn_id = cid, %client, %user, database = db,
+                    conn_id = cid, protocol, %client, %user, database = db,
                     "client handshake"
                 );
             }
             Event::Authenticated => {
-                tracing::info!(conn_id = cid, %client, %user, database = db, "authenticated");
+                tracing::info!(conn_id = cid, protocol, %client, %user, database = db, "authenticated");
             }
             Event::AuthFailed { code, message } => {
-                tracing::warn!(conn_id = cid, %client, %user, code, message, "auth failed");
+                tracing::warn!(conn_id = cid, protocol, %client, %user, code, message, "auth failed");
             }
             Event::Query { sql } => {
-                tracing::info!(conn_id = cid, %client, %user, database = db, sql, "COM_QUERY");
+                tracing::info!(conn_id = cid, protocol, %client, %user, database = db, sql, "COM_QUERY");
             }
-            Event::StmtPrepare { stmt_id, num_params, sql } => {
+            Event::StmtPrepare {
+                stmt_id,
+                num_params,
+                sql,
+            } => {
                 tracing::info!(
-                    conn_id = cid, %client, %user, database = db,
+                    conn_id = cid, protocol, %client, %user, database = db,
                     stmt_id, num_params, sql,
                     "COM_STMT_PREPARE"
                 );
             }
-            Event::StmtExecute { stmt_id, sql, params } => {
+            Event::StmtExecute {
+                stmt_id,
+                sql,
+                params,
+            } => {
                 let params_sql: Vec<String> = params.iter().map(|v| v.as_sql(false)).collect();
                 match sql {
                     Some(tpl) => tracing::info!(
-                        conn_id = cid, %client, %user, database = db,
+                        conn_id = cid, protocol, %client, %user, database = db,
                         stmt_id, sql = tpl, params = ?params_sql,
                         "COM_STMT_EXECUTE"
                     ),
                     None => tracing::info!(
-                        conn_id = cid, %client, %user, database = db,
+                        conn_id = cid, protocol, %client, %user, database = db,
                         stmt_id, params = ?params_sql,
                         "COM_STMT_EXECUTE"
                     ),
                 }
             }
             Event::InitDb { database } => {
-                tracing::info!(conn_id = cid, %client, %user, database, "COM_INIT_DB");
+                tracing::info!(conn_id = cid, protocol, %client, %user, database, "COM_INIT_DB");
             }
             Event::Quit => {
-                tracing::info!(conn_id = cid, %client, %user, "COM_QUIT");
+                tracing::info!(conn_id = cid, protocol, %client, %user, "COM_QUIT");
             }
-            Event::QueryOk { affected_rows, last_insert_id, warnings } => {
+            Event::QueryOk {
+                affected_rows,
+                last_insert_id,
+                warnings,
+            } => {
                 tracing::debug!(
-                    conn_id = cid, %client, %user, database = db,
+                    conn_id = cid, protocol, %client, %user, database = db,
                     affected_rows, last_insert_id = ?last_insert_id, warnings,
                     "query ok"
                 );
             }
-            Event::QueryError { code, sql_state, message } => {
+            Event::QueryError {
+                code,
+                sql_state,
+                message,
+            } => {
                 tracing::warn!(
-                    conn_id = cid, %client, %user, database = db,
+                    conn_id = cid, protocol, %client, %user, database = db,
                     code, sql_state = ?sql_state, message,
                     "query error"
+                );
+            }
+            Event::PgStartup {
+                protocol_version,
+                params,
+            } => {
+                tracing::info!(
+                    conn_id = cid, protocol, %client, %user, database = db,
+                    protocol_version, params = ?params,
+                    "pg startup"
+                );
+            }
+            Event::PgSslRequest => {
+                tracing::info!(conn_id = cid, protocol, %client, "pg ssl request");
+            }
+            Event::PgCancelRequest {
+                process_id,
+                secret_key,
+            } => {
+                tracing::info!(
+                    conn_id = cid, protocol, %client, process_id, secret_key,
+                    "pg cancel request"
+                );
+            }
+            Event::PgAuthRequest { method } => {
+                tracing::info!(conn_id = cid, protocol, %client, %user, method, "pg auth request");
+            }
+            Event::PgAuthenticated => {
+                tracing::info!(conn_id = cid, protocol, %client, %user, database = db, "pg authenticated");
+            }
+            Event::PgAuthFailed {
+                severity,
+                code,
+                message,
+            } => {
+                tracing::warn!(
+                    conn_id = cid, protocol, %client, %user,
+                    severity = ?severity, code = ?code, message,
+                    "pg auth failed"
+                );
+            }
+            Event::PgSimpleQuery { sql } => {
+                tracing::info!(conn_id = cid, protocol, %client, %user, database = db, sql, "pg query");
+            }
+            Event::PgParse {
+                statement,
+                sql,
+                param_types,
+            } => {
+                tracing::info!(
+                    conn_id = cid, protocol, %client, %user, database = db,
+                    statement, sql, param_types = ?param_types,
+                    "pg parse"
+                );
+            }
+            Event::PgBind {
+                portal,
+                statement,
+                param_formats,
+                params,
+                result_formats,
+            } => {
+                tracing::info!(
+                    conn_id = cid, protocol, %client, %user, database = db,
+                    portal, statement, param_formats = ?param_formats, params = ?params,
+                    result_formats = ?result_formats,
+                    "pg bind"
+                );
+            }
+            Event::PgDescribe { target, name } => {
+                tracing::info!(
+                    conn_id = cid, protocol, %client, %user, target, name,
+                    "pg describe"
+                );
+            }
+            Event::PgExecute {
+                portal,
+                statement,
+                sql,
+                params,
+                max_rows,
+            } => {
+                tracing::info!(
+                    conn_id = cid, protocol, %client, %user, database = db,
+                    portal, statement = ?statement, sql = ?sql, params = ?params, max_rows,
+                    "pg execute"
+                );
+            }
+            Event::PgClose { target, name } => {
+                tracing::info!(conn_id = cid, protocol, %client, %user, target, name, "pg close");
+            }
+            Event::PgFlush => {
+                tracing::debug!(conn_id = cid, protocol, %client, %user, "pg flush");
+            }
+            Event::PgSync => {
+                tracing::debug!(conn_id = cid, protocol, %client, %user, "pg sync");
+            }
+            Event::PgTerminate => {
+                tracing::info!(conn_id = cid, protocol, %client, %user, "pg terminate");
+            }
+            Event::PgParseComplete => {
+                tracing::debug!(conn_id = cid, protocol, %client, %user, "pg parse complete");
+            }
+            Event::PgBindComplete => {
+                tracing::debug!(conn_id = cid, protocol, %client, %user, "pg bind complete");
+            }
+            Event::PgCloseComplete => {
+                tracing::debug!(conn_id = cid, protocol, %client, %user, "pg close complete");
+            }
+            Event::PgCommandComplete { tag } => {
+                tracing::debug!(conn_id = cid, protocol, %client, %user, database = db, tag, "pg command complete");
+            }
+            Event::PgReadyForQuery { status } => {
+                tracing::debug!(conn_id = cid, protocol, %client, %user, database = db, status, "pg ready");
+            }
+            Event::PgError {
+                severity,
+                code,
+                message,
+            } => {
+                tracing::warn!(
+                    conn_id = cid, protocol, %client, %user, database = db,
+                    severity = ?severity, code = ?code, message,
+                    "pg error"
                 );
             }
         }
@@ -156,7 +308,9 @@ impl JsonlConsumer {
     /// Open `path` for appending (creates the file if it doesn't exist).
     pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(Self { writer: Mutex::new(BufWriter::new(file)) })
+        Ok(Self {
+            writer: Mutex::new(BufWriter::new(file)),
+        })
     }
 }
 
@@ -267,8 +421,8 @@ impl KafkaSink {
     /// Connect to Kafka and spawn a background producer task.
     pub async fn new(broker: &str, topic: &str) -> anyhow::Result<Self> {
         use rskafka::client::{
-            partition::{Compression, UnknownTopicHandling},
             ClientBuilder,
+            partition::{Compression, UnknownTopicHandling},
         };
         use rskafka::record::Record;
 

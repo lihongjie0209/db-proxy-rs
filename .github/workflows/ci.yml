@@ -21,8 +21,17 @@ on:
 
 jobs:
   integration-test:
-    name: Integration Tests
+    name: Integration Tests · ${{ matrix.protocol }}
     runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - protocol: mysql
+            compose_file: docker-compose.test.yml
+          - protocol: postgres
+            compose_file: docker-compose.test-pg.yml
 
     steps:
       - uses: actions/checkout@v4
@@ -32,14 +41,14 @@ jobs:
 
       - name: Run integration tests via Docker Compose
         run: |
-          docker compose -f docker-compose.test.yml \
+          docker compose -f ${{ matrix.compose_file }} \
             up --build --abort-on-container-exit \
             --exit-code-from runner
 
       - name: Show proxy logs on failure
         if: failure()
-        run: docker compose -f docker-compose.test.yml logs proxy
+        run: docker compose -f ${{ matrix.compose_file }} logs proxy
 
       - name: Cleanup
         if: always()
-        run: docker compose -f docker-compose.test.yml down -v --remove-orphans
+        run: docker compose -f ${{ matrix.compose_file }} down -v --remove-orphans
