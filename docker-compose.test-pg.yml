@@ -47,9 +47,8 @@ services:
         condition: service_healthy
     environment:
       NO_COLOR: "1"
+    entrypoint: ["python", "/tests/integration_test_pg.py"]
     command:
-      - python
-      - /tests/integration_test_pg.py
       - --no-docker
       - --proxy-host
       - proxy
